@@ -1,9 +1,10 @@
-import json
 import os
+import re
 import smtplib
 import ssl
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from email.message import EmailMessage
+from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright
 
@@ -22,84 +23,78 @@ def scrape_product_price() -> dict[str, str]:
             page = browser.new_page(user_agent=USER_AGENT)
             page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
 
-            product_group = None
-            for script_text in page.locator(
-                'script[type="application/ld+json"]'
-            ).all_inner_texts():
-                try:
-                    structured_data = json.loads(script_text)
-                except json.JSONDecodeError:
+            offers = []
+            cards = page.locator(
+                "ul.swiper-wrapper a[href*='/p/google-pixel-10-pro/']"
+            )
+            page.wait_for_function(
+                """() => Array.from(document.querySelectorAll(
+                    "ul.swiper-wrapper a[href*='/p/google-pixel-10-pro/']"
+                )).some(card => /\\d+\\s*GB/.test(card.innerText) &&
+                    /€/.test(card.innerText))
+                """,
+                timeout=30_000,
+            )
+            for card in cards.all():
+                lines = [
+                    line.strip()
+                    for line in card.inner_text().splitlines()
+                    if line.strip()
+                ]
+                storage_index = next(
+                    (
+                        index
+                        for index, line in enumerate(lines)
+                        if re.fullmatch(r"\d+\s*GB", line)
+                    ),
+                    None,
+                )
+                price_line = next(
+                    (line for line in lines if "€" in line), None
+                )
+                if storage_index is None or price_line is None:
                     continue
 
-                pending = [structured_data]
-                while pending:
-                    node = pending.pop()
-                    if isinstance(node, list):
-                        pending.extend(node)
-                    elif isinstance(node, dict):
-                        node_type = node.get("@type", [])
-                        if (
-                            node.get("name") == PRODUCT_NAME
-                            and (
-                                node_type == "ProductGroup"
-                                or (
-                                    isinstance(node_type, list)
-                                    and "ProductGroup" in node_type
-                                )
-                            )
-                        ):
-                            product_group = node
-                            break
-                        pending.extend(
-                            value
-                            for key, value in node.items()
-                            if key in ("@graph", "hasVariant")
-                        )
-                if product_group:
-                    break
+                storage = int(re.search(r"\d+", lines[storage_index]).group())
+                if storage < 256:
+                    continue
 
-            if product_group is None:
-                raise RuntimeError(
-                    f"Could not find structured product data for {PRODUCT_NAME} "
-                    f"on {BASE_URL}"
+                price_match = re.search(
+                    r"€\s*([\d.]+(?:,\d{2})?)", price_line
+                )
+                if price_match is None:
+                    continue
+                amount = Decimal(
+                    price_match.group(1).replace(".", "").replace(",", ".")
                 )
 
-            offers = []
-            for variant in product_group.get("hasVariant", []):
-                if variant.get("size") not in ("256 GB", "512 GB"):
-                    continue
-
-                variant_offers = variant.get("offers", [])
-                if isinstance(variant_offers, dict):
-                    variant_offers = [variant_offers]
-
-                for offer in variant_offers:
-                    if (
-                        offer.get("priceCurrency") != "EUR"
-                        or not str(offer.get("availability", "")).endswith(
-                            "/InStock"
-                        )
-                    ):
-                        continue
-                    try:
-                        amount = Decimal(str(offer["price"]))
-                    except (KeyError, InvalidOperation):
-                        continue
-                    offers.append((amount, variant, offer))
+                color = lines[0]
+                condition = (
+                    lines[storage_index + 1]
+                    if storage_index + 1 < len(lines)
+                    else "Condition not listed"
+                )
+                offers.append(
+                    (
+                        amount,
+                        f"{color} - {storage} GB - {condition}",
+                        urljoin(page.url, card.get_attribute("href") or ""),
+                    )
+                )
 
             if not offers:
                 raise RuntimeError(
-                    f"No in-stock 256 GB or 512 GB EUR offers found for "
-                    f"{PRODUCT_NAME} on {BASE_URL}"
+                    f"No offers of 256 GB or more found for {PRODUCT_NAME} "
+                    f"on {BASE_URL}"
                 )
 
-            amount, variant, offer = min(offers, key=lambda item: item[0])
+            amount, variant, offer_url = min(offers, key=lambda item: item[0])
             whole, fraction = f"{amount:,.2f}".split(".")
             price_text = f"€{whole.replace(',', '.')},{fraction}"
             return {
                 "price": price_text,
-                "variant": variant["name"],
-                "url": offer.get("url", product_group.get("url", page.url)),
+                "variant": variant,
+                "url": offer_url,
             }
         finally:
             browser.close()
@@ -123,8 +118,8 @@ def send_email(price_data: dict[str, str]) -> None:
     message.set_content(
         f"""Daily price check for the {PRODUCT_NAME} on Refurbed.be
 
-Current displayed price: {price_data['price']}
-Cheapest matching in-stock option: {price_data['variant']}
+Cheapest listed option with at least 256 GB storage: {price_data['price']}
+Configuration: {price_data['variant']}
 Product page: {price_data['url']}
 """
     )
