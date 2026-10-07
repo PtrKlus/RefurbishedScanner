@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import smtplib
@@ -16,81 +17,183 @@ USER_AGENT = (
 )
 
 
+def _current_offer(page) -> dict[str, object] | None:
+    for script_text in page.locator(
+        'script[type="application/ld+json"]'
+    ).all_inner_texts():
+        try:
+            structured_data = json.loads(script_text)
+        except json.JSONDecodeError:
+            continue
+
+        pending = [structured_data]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, list):
+                pending.extend(node)
+            elif isinstance(node, dict):
+                node_type = node.get("@type", [])
+                if node_type == "BuyAction" or (
+                    isinstance(node_type, list) and "BuyAction" in node_type
+                ):
+                    action = node.get("object", {})
+                    offer = action.get("offers") if isinstance(action, dict) else None
+                    if isinstance(offer, dict):
+                        return offer
+                pending.extend(
+                    value
+                    for key, value in node.items()
+                    if key == "@graph"
+                )
+    return None
+
+
+def _selected_option_label(page, selector_id: str) -> str:
+    select = page.locator(f"#{selector_id}")
+    if select.count() == 0:
+        return "not listed"
+    text = select.evaluate(
+        "element => "
+        "element.selectedOptions[0]?.textContent?.trim() || ''"
+    )
+    return re.split(r"\s*[+-]\s*€", text, maxsplit=1)[0].strip()
+
+
 def scrape_product_price() -> dict[str, str]:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
             page = browser.new_page(user_agent=USER_AGENT)
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60_000)
+            response = page.goto(
+                BASE_URL, wait_until="domcontentloaded", timeout=60_000
+            )
+            if response is None or response.status >= 400:
+                status = response.status if response is not None else "no response"
+                raise RuntimeError(
+                    f"Product page request failed ({status}): {BASE_URL}"
+                )
 
+            consent_button = page.get_by_role(
+                "button", name=re.compile(r"Beperkt gebruik|Limited use", re.I)
+            )
+            if consent_button.count() and consent_button.first.is_visible():
+                consent_button.first.click(timeout=5_000)
+
+            pending_urls = [BASE_URL]
+            queued_urls = {BASE_URL}
             offers = []
-            cards = page.locator(
-                "ul.swiper-wrapper a[href*='/p/google-pixel-10-pro/']"
-            )
-            page.wait_for_function(
-                """() => Array.from(document.querySelectorAll(
-                    "ul.swiper-wrapper a[href*='/p/google-pixel-10-pro/']"
-                )).some(card => /\\d+\\s*GB/.test(card.innerText) &&
-                    /€/.test(card.innerText))
-                """,
-                timeout=30_000,
-            )
-            for card in cards.all():
-                lines = [
-                    line.strip()
-                    for line in card.inner_text().splitlines()
-                    if line.strip()
-                ]
-                storage_index = next(
-                    (
-                        index
-                        for index, line in enumerate(lines)
-                        if re.fullmatch(r"\d+\s*GB", line)
-                    ),
-                    None,
-                )
-                price_line = next(
-                    (line for line in lines if "€" in line), None
-                )
-                if storage_index is None or price_line is None:
-                    continue
+            visited_count = 0
 
-                storage = int(re.search(r"\d+", lines[storage_index]).group())
-                if storage < 256:
-                    continue
-
-                price_match = re.search(
-                    r"€\s*([\d.]+(?:,\d{2})?)", price_line
+            while pending_urls:
+                offer_url = pending_urls.pop()
+                response = page.goto(
+                    offer_url, wait_until="domcontentloaded", timeout=60_000
                 )
-                if price_match is None:
-                    continue
-                amount = Decimal(
-                    price_match.group(1).replace(".", "").replace(",", ".")
-                )
-
-                color = lines[0]
-                condition = (
-                    lines[storage_index + 1]
-                    if storage_index + 1 < len(lines)
-                    else "Condition not listed"
-                )
-                offers.append(
-                    (
-                        amount,
-                        f"{color} - {storage} GB - {condition}",
-                        urljoin(page.url, card.get_attribute("href") or ""),
+                if response is None or response.status >= 400:
+                    status = response.status if response is not None else "no response"
+                    raise RuntimeError(
+                        f"Could not load Refurbed configuration ({status}): "
+                        f"{offer_url}"
                     )
+
+                if consent_button.count() and consent_button.first.is_visible():
+                    consent_button.first.click(timeout=5_000)
+
+                storage_select = page.locator("#product-storage")
+                storage_select.wait_for(state="attached", timeout=30_000)
+                storage_text = storage_select.evaluate(
+                    "select => select.selectedOptions[0]?.textContent?.trim() || ''"
                 )
+                storage_match = re.search(r"(\d+)\s*GB", storage_text)
+                if storage_match is None:
+                    raise RuntimeError(
+                        f"Could not determine storage for Refurbed configuration "
+                        f"{offer_url}: {storage_text!r}"
+                    )
+                storage = int(storage_match.group(1))
+                visited_count += 1
+
+                if storage >= 256:
+                    offer = _current_offer(page)
+                    if offer is None:
+                        raise RuntimeError(
+                            f"Refurbed did not provide structured price data for "
+                            f"configuration {offer_url}"
+                        )
+                    if (
+                        offer.get("priceCurrency") == "EUR"
+                        and str(offer.get("availability", "")).endswith(
+                            "/InStock"
+                        )
+                    ):
+                        color = _selected_option_label(page, "product-color")
+                        grade = _selected_option_label(page, "product-grade")
+                        battery = _selected_option_label(
+                            page, "product-battery"
+                        )
+                        amount = Decimal(str(offer["price"]))
+                        offers.append(
+                            (
+                                amount,
+                                f"{color} - {storage} GB - {grade} - {battery}",
+                                offer_url,
+                            )
+                        )
+
+                for select in page.locator(
+                    "select[id^='product-']"
+                ).all():
+                    select_id = select.get_attribute("id")
+                    if select_id not in {
+                        "product-storage",
+                        "product-color",
+                        "product-grade",
+                        "product-battery",
+                    }:
+                        continue
+                    if storage < 256 and select_id != "product-storage":
+                        continue
+
+                    options = select.locator("option").evaluate_all(
+                        """options => options.map(option => ({
+                            text: option.textContent.trim(),
+                            value: option.value,
+                            disabled: option.disabled
+                        }))"""
+                    )
+                    for option in options:
+                        if option["disabled"] or not option["value"].startswith(
+                            "/p/google-pixel-10-pro/"
+                        ):
+                            continue
+                        if select_id == "product-storage":
+                            option_storage = re.search(
+                                r"(\d+)\s*GB", option["text"]
+                            )
+                            if (
+                                option_storage is None
+                                or int(option_storage.group(1)) < 256
+                            ):
+                                continue
+
+                        next_url = urljoin(BASE_URL, option["value"])
+                        if next_url not in queued_urls:
+                            queued_urls.add(next_url)
+                            pending_urls.append(next_url)
 
             if not offers:
                 raise RuntimeError(
                     f"No offers of 256 GB or more found for {PRODUCT_NAME} "
-                    f"on {BASE_URL}"
+                    f"after checking {visited_count} available configurations"
                 )
 
             amount, variant, offer_url = min(offers, key=lambda item: item[0])
             whole, fraction = f"{amount:,.2f}".split(".")
             price_text = f"€{whole.replace(',', '.')},{fraction}"
+            print(
+                f"Checked {visited_count} configurations; found "
+                f"{len(offers)} in-stock offers with at least 256 GB."
+            )
             return {
                 "price": price_text,
                 "variant": variant,

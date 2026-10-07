@@ -1,9 +1,11 @@
 # Refurbished price tracker
 
 The GitHub Actions workflow checks Refurbed.be's Google Pixel 10 Pro offers
-every day at 07:00 UTC and emails the cheapest listed configuration with at
-least 256 GB of storage, across colors and appearance grades. You can also
-start it any time from the repository's **Actions** tab with **Run workflow**.
+every day at 07:00 UTC and emails the cheapest in-stock configuration with at
+least 256 GB of storage. It follows Refurbed's storage, color, appearance, and
+battery selectors, so an appearance choice that is unavailable for one
+configuration can still be found under another. You can also start it from the
+repository's **Actions** tab with **Run workflow**.
 
 ## Set up Gmail delivery
 
