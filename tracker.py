@@ -5,12 +5,13 @@ import smtplib
 import ssl
 from decimal import Decimal
 from email.message import EmailMessage
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import sync_playwright
 
-BASE_URL = "https://www.refurbed.be/p/google-pixel-10-pro/"
-PRODUCT_NAME = "Google Pixel 10 Pro"
+BASE_URL = "https://www.refurbed.at/p/iphone-16-pro/"
+PRODUCT_NAME = "iPhone 16 Pro"
+PRODUCT_PATH = f"{urlsplit(BASE_URL).path.rstrip('/')}/"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -74,7 +75,10 @@ def scrape_product_price() -> dict[str, str]:
                 )
 
             consent_button = page.get_by_role(
-                "button", name=re.compile(r"Beperkt gebruik|Limited use", re.I)
+                "button",
+                name=re.compile(
+                    r"Beperkt gebruik|Limited use|Eingeschränkt nutzen", re.I
+                ),
             )
             if consent_button.count() and consent_button.first.is_visible():
                 consent_button.first.click(timeout=5_000)
@@ -163,7 +167,7 @@ def scrape_product_price() -> dict[str, str]:
                     )
                     for option in options:
                         if option["disabled"] or not option["value"].startswith(
-                            "/p/google-pixel-10-pro/"
+                            PRODUCT_PATH
                         ):
                             continue
                         if select_id == "product-storage":
@@ -219,7 +223,7 @@ def send_email(price_data: dict[str, str]) -> None:
     message["To"] = recipient
     message["Subject"] = f"Daily Refurbed price update: {PRODUCT_NAME}"
     message.set_content(
-        f"""Daily price check for the {PRODUCT_NAME} on Refurbed.be
+        f"""        Daily price check for the {PRODUCT_NAME} on Refurbed.at
 
 Cheapest listed option with at least 256 GB storage: {price_data['price']}
 Configuration: {price_data['variant']}
