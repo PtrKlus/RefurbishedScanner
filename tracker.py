@@ -60,6 +60,25 @@ def _selected_option_label(page, selector_id: str) -> str:
     return re.split(r"\s*[+-]\s*€", text, maxsplit=1)[0].strip()
 
 
+def _is_two_esim_option(text: str) -> bool:
+    return re.search(r"\b2\s*e[\s-]?sims?\b", text, re.IGNORECASE) is not None
+
+
+def _selected_sim_option(page) -> str:
+    for select in page.locator("select").all():
+        option_texts = select.locator("option").all_inner_texts()
+        if any(_is_two_esim_option(text) for text in option_texts):
+            return select.evaluate(
+                "element => "
+                "element.selectedOptions[0]?.textContent?.trim() || ''"
+            )
+
+    title_match = re.search(
+        r"Dual-SIM\s*\([^)]*\)", page.title(), re.IGNORECASE
+    )
+    return title_match.group(0) if title_match else "not listed"
+
+
 def scrape_product_price() -> dict[str, str]:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -104,9 +123,13 @@ def scrape_product_price() -> dict[str, str]:
                     consent_button.first.click(timeout=5_000)
 
                 storage_select = page.locator("#product-storage")
-                storage_select.wait_for(state="attached", timeout=30_000)
-                storage_text = storage_select.evaluate(
-                    "select => select.selectedOptions[0]?.textContent?.trim() || ''"
+                storage_text = (
+                    storage_select.evaluate(
+                        "select => "
+                        "select.selectedOptions[0]?.textContent?.trim() || ''"
+                    )
+                    if storage_select.count()
+                    else page.title()
                 )
                 storage_match = re.search(r"(\d+)\s*GB", storage_text)
                 if storage_match is None:
@@ -116,6 +139,16 @@ def scrape_product_price() -> dict[str, str]:
                     )
                 storage = int(storage_match.group(1))
                 visited_count += 1
+
+                sim_option = _selected_sim_option(page)
+                sim_selects = [
+                    select
+                    for select in page.locator("select").all()
+                    if any(
+                        _is_two_esim_option(text)
+                        for text in select.locator("option").all_inner_texts()
+                    )
+                ]
 
                 if storage >= 256:
                     offer = _current_offer(page)
@@ -135,25 +168,36 @@ def scrape_product_price() -> dict[str, str]:
                         battery = _selected_option_label(
                             page, "product-battery"
                         )
-                        amount = Decimal(str(offer["price"]))
-                        offers.append(
-                            (
-                                amount,
-                                f"{color} - {storage} GB - {grade} - {battery}",
-                                offer_url,
+                        if not _is_two_esim_option(sim_option):
+                            amount = Decimal(str(offer["price"]))
+                            sim = re.split(
+                                r"\s*[+-]\s*€", sim_option, maxsplit=1
+                            )[0].strip()
+                            offers.append(
+                                (
+                                    amount,
+                                    f"{color} - {storage} GB - {grade} - "
+                                    f"{battery} - {sim}",
+                                    offer_url,
+                                )
                             )
-                        )
 
                 for select in page.locator(
                     "select[id^='product-']"
-                ).all():
+                ).all() + sim_selects:
                     select_id = select.get_attribute("id")
+                    option_texts = select.locator("option").all_inner_texts()
+                    is_sim_selector = any(
+                        _is_two_esim_option(text) for text in option_texts
+                    )
                     if select_id not in {
                         "product-storage",
                         "product-color",
                         "product-grade",
                         "product-battery",
-                    }:
+                    } and not is_sim_selector:
+                        continue
+                    if _is_two_esim_option(sim_option) and not is_sim_selector:
                         continue
                     if storage < 256 and select_id != "product-storage":
                         continue
@@ -166,6 +210,10 @@ def scrape_product_price() -> dict[str, str]:
                         }))"""
                     )
                     for option in options:
+                        if is_sim_selector and _is_two_esim_option(
+                            option["text"]
+                        ):
+                            continue
                         if option["disabled"] or not option["value"].startswith(
                             PRODUCT_PATH
                         ):
