@@ -197,8 +197,6 @@ def scrape_product_price() -> dict[str, str]:
                         "product-battery",
                     } and not is_sim_selector:
                         continue
-                    if _is_two_esim_option(sim_option) and not is_sim_selector:
-                        continue
                     if storage < 256 and select_id != "product-storage":
                         continue
 
